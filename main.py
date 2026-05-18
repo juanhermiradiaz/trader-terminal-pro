@@ -1,6 +1,7 @@
 import asyncio
 import yfinance as yf
 import pandas as pd
+import sqlite3
 import json
 import threading
 import time
@@ -12,11 +13,11 @@ import pandas_ta as ta
 
 app = Flask(__name__)
 
-# --- ALMACÉN DE DATOS EN MEMORIA (Más rápido y fiable en la nube) ---
-DATA_STORE = {
-    "stocks": [],
-    "last_sync": "Nunca"
-}
+# --- CONFIGURACIÓN DE RUTA ABSOLUTA PARA RENDER ---
+if os.name == 'nt': # Windows local
+    DB_PATH = os.path.join(os.getcwd(), "tr_terminal.db")
+else: # Linux / Render
+    DB_PATH = "/tmp/tr_terminal.db"
 
 WATCHLIST = {
     "GGD.TO": {"name": "Gogold Resources"},
@@ -28,8 +29,46 @@ WATCHLIST = {
     "TSM": {"name": "TSMC (ADR)"}
 }
 
+# --- MOTOR DE BASE DE DATOS ---
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS signals 
+                 (ticker TEXT PRIMARY KEY, name TEXT, price_eur REAL, currency TEXT,
+                  trend TEXT, buy_price REAL, stop_loss REAL, commentary TEXT, 
+                  chart_json TEXT, last_updated TEXT)''')
+    conn.commit()
+    conn.close()
+
+def save_to_db(ticker, s):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''INSERT OR REPLACE INTO signals VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                  (ticker, s['name'], s['price_eur'], s['currency'], s['trend'], 
+                   s['buy_price'], s['stop_loss'], s['commentary'], json.dumps(s['chart']), s['last_updated']))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"❌ Error DB: {e}")
+
+def get_from_db():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute('SELECT * FROM signals ORDER BY name ASC').fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except:
+        return []
+
+# --- AGENTE EN SEGUNDO PLANO ---
 def agent_loop():
-    print("--- 💹 AGENTE EURO-PRO v9.5 (Memory Mode) ---")
+    print(f"--- 💹 AGENTE INICIADO (DB: {DB_PATH}) ---")
+    init_db()
+    
+    # Pausa inicial para dejar que el servidor web respire
+    time.sleep(10)
     
     while True:
         try:
@@ -44,7 +83,6 @@ def agent_loop():
                     if 'EURCAD=X' in fx: cad_to_eur = 1 / fx['EURCAD=X'].iloc[-1]
             except: pass
 
-            temp_stocks = []
             for ticker, info in WATCHLIST.items():
                 try:
                     stock = yf.Ticker(ticker)
@@ -71,50 +109,43 @@ def agent_loop():
 
                     limit = 60
                     dates = df.index.strftime('%Y-%m-%d').tolist()[-limit:]
-                    prices = [round(float(x) * rate, 2) for x in df['Close'].tolist()][-limit:]
+                    prices = [round(float(x) * rate, 2) for x in df['Close'].tolist()[-limit:]]
                     ema20_l = get_safe_col(df, 'EMA_20', rate)[-limit:]
                     ema50_l = get_safe_col(df, 'EMA_50', rate)[-limit:]
                     rsi_l = get_safe_col(df, 'RSI')[-limit:]
                     
-                    stock_data = {
-                        'ticker': ticker,
-                        'name': info['name'], 
-                        'price_eur': prices[-1],
+                    data = {
+                        'name': info['name'], 'price_eur': prices[-1], 'currency': 'EUR',
                         'trend': "Alcista ↑" if prices[-1] > ema20_l[-1] else "Bajista ↓",
-                        'buy_price': round(ema20_l[-1], 2), 
-                        'stop_loss': round(ema50_l[-1] * 0.97, 2),
-                        'commentary': f"RSI: {rsi_l[-1]:.1f}.",
-                        'chart_json': json.dumps({
+                        'buy_price': round(ema20_l[-1], 2), 'stop_loss': round(ema50_l[-1] * 0.97, 2),
+                        'commentary': f"Ref: {prices[-1]:.2f}€. RSI: {rsi_l[-1]:.1f}.",
+                        'last_updated': datetime.now().strftime("%H:%M:%S"),
+                        'chart': {
                             'dates': dates, 'prices': prices, 'ema20': ema20_l, 'ema50': ema50_l,
                             'rsi': rsi_l, 'macd': get_safe_col(df, 'macd', rate)[-limit:],
                             'macds': get_safe_col(df, 'macds', rate)[-limit:], 'macdh': get_safe_col(df, 'macdh', rate)[-limit:],
                             'bbu': get_safe_col(df, 'BBU', rate)[-limit:], 'bbl': get_safe_col(df, 'BBL', rate)[-limit:]
-                        })
+                        }
                     }
-                    temp_stocks.append(stock_data)
-                    print(f"   ✅ {info['name']} analizado.")
+                    save_to_db(ticker, data)
+                    print(f"   ✅ {info['name']} guardado.")
                 except Exception as e:
                     print(f"   ❌ Error en {ticker}: {e}")
-
-            # Actualizar el almacén global
-            DATA_STORE["stocks"] = temp_stocks
-            DATA_STORE["last_sync"] = datetime.now().strftime("%H:%M:%S")
             
-            print(f"--- ✨ Sincronización Exitosa: {DATA_STORE['last_sync']} ---")
+            print(f"--- ✨ Ciclo completado. Siguiente en 2 min ---")
             time.sleep(120)
-            
         except Exception as e: 
-            print(f"❌ Error Crítico: {e}")
+            print(f"❌ Error Agente: {e}")
             time.sleep(30)
 
-# Lanzar el agente inmediatamente
+# Lanzar el agente (Fuera del if name == main)
 threading.Thread(target=agent_loop, daemon=True).start()
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8"><title>Terminal PRO Cloud</title>
+    <meta charset="UTF-8"><title>Terminal PRO Trader</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <style>
@@ -128,11 +159,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
 <div class="container py-5">
-    <div class="d-flex justify-content-between align-items-center mb-4">
-        <h1 class="fw-bold text-info">Terminal de Trading Pro</h1>
-        <div class="text-end text-muted small">Última actualización: {{ last_sync }}</div>
-    </div>
-    
+    <h1 class="fw-bold text-info text-center mb-4">Terminal de Trading Profesional</h1>
     <div class="legend-card p-4 shadow text-center">
         <div class="row">
             <div class="col-md-3 border-end border-secondary"><span class="kpi-title">EMA 20 (Blanca)</span><br><small>Entrada Corto Plazo.</small></div>
@@ -145,7 +172,7 @@ HTML_TEMPLATE = """
     {% if not stocks %}
     <div class="alert alert-info text-center">
         <div class="spinner-border spinner-border-sm me-2"></div>
-        Analizando mercados... La primera carga tarda unos 20 segundos. Refresca ahora.
+        Analizando mercados... La primera carga tarda unos 30 segundos. <b>Refresca esta página ahora</b>.
     </div>
     {% endif %}
 
@@ -154,11 +181,11 @@ HTML_TEMPLATE = """
         <div class="row align-items-center mb-4">
             <div class="col-md-4">
                 <h2 class="fw-bold mb-1">{{ s.name }}</h2>
-                <div class="h3 text-success">{{ "%.2f"|format(s.price_eur) }} €</div>
+                <div class="h3 text-success">{{ "%.2f"|format(s.price_eur or 0) }} €</div>
                 <span class="badge {% if '↑' in s.trend %}bg-success{% else %}bg-danger{% endif %}">{{ s.trend }}</span>
             </div>
-            <div class="col-md-4"><div class="buy-zone text-center"><small class="text-info fw-bold uppercase">COMPRA IDEAL</small><div class="h3 fw-bold text-white">{{ s.buy_price }} €</div></div></div>
-            <div class="col-md-4"><div class="stop-zone text-center"><small class="text-danger fw-bold uppercase">STOP LOSS</small><div class="h3 fw-bold text-white">{{ s.stop_loss }} €</div></div></div>
+            <div class="col-md-4"><div class="buy-zone text-center"><small class="text-info fw-bold uppercase">COMPRA IDEAL</small><div class="h3 fw-bold text-white">{{ "%.2f"|format(s.buy_price or 0) }} €</div></div></div>
+            <div class="col-md-4"><div class="stop-zone text-center"><small class="text-danger fw-bold uppercase">STOP LOSS</small><div class="h3 fw-bold text-white">{{ "%.2f"|format(s.stop_loss or 0) }} €</div></div></div>
         </div>
         <div id="chart-{{ s.ticker }}" style="height: 600px;"></div>
     </div>
@@ -198,7 +225,7 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE, stocks=DATA_STORE["stocks"], last_sync=DATA_STORE["last_sync"])
+    return render_template_string(HTML_TEMPLATE, stocks=get_from_db())
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
