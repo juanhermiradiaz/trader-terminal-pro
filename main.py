@@ -14,7 +14,6 @@ import pandas_ta as ta
 app = Flask(__name__)
 
 # --- CONFIGURACIÓN DE RUTA ---
-# En Render, /tmp es el único lugar con garantía de escritura en el plan gratuito
 if os.path.exists("/tmp"):
     DB_PATH = "/tmp/tr_terminal.db"
 else:
@@ -60,6 +59,11 @@ def get_from_db():
         conn.close()
         return [dict(r) for r in rows]
     except: return []
+
+def send_alert(msg):
+    if TG_TOKEN and TG_CHATID:
+        try: requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data={"chat_id": TG_CHATID, "text": msg}, timeout=10)
+        except: pass
 
 def agent_loop():
     print("--- 💹 AGENTE EURO-PRO v9.4 (Cloud Optimization) ---")
@@ -108,7 +112,7 @@ def agent_loop():
 
                     limit = 60
                     dates = df.index.strftime('%Y-%m-%d').tolist()[-limit:]
-                    prices = [round(float(x) * rate, 2) for x in df['Close'].tolist()][-limit:]
+                    prices = [round(float(x) * rate, 2) for x in df['Close'].tolist()[-limit:]]
                     ema20_l = get_safe_col(df, 'EMA_20', rate)[-limit:]
                     ema50_l = get_safe_col(df, 'EMA_50', rate)[-limit:]
                     rsi_l = get_safe_col(df, 'RSI')[-limit:]
@@ -144,7 +148,7 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8"><title>Terminal Pro Trader</title>
+    <meta charset="UTF-8"><title>Terminal TR PRO Cloud</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <style>
@@ -159,12 +163,12 @@ HTML_TEMPLATE = """
 <body>
 <div class="container py-5">
     <h1 class="fw-bold text-info text-center mb-4">Terminal de Trading Profesional</h1>
-    <div class="legend-card p-4 shadow text-center">
-        <div class="row">
-            <div class="col-md-3 border-end border-secondary"><span class="kpi-title">EMA 20 (Blanca)</span><br><small>Entrada Corto Plazo.</small></div>
-            <div class="col-md-3 border-end border-secondary"><span class="kpi-title" style="color:#fbbf24">EMA 50 (Amarilla)</span><br><small>Soporte de Seguridad.</small></div>
-            <div class="col-md-3 border-end border-secondary"><span class="kpi-title" style="color:#f87171">MACD / HIST</span><br><small>Barras = Aceleración.</small></div>
-            <div class="col-md-3"><span class="kpi-title" style="color:#ff00ff">RSI (Fuerza)</span><br><small>Fuerza del mercado.</small></div>
+    <div class="legend-card p-4 shadow">
+        <div class="row text-center small">
+            <div class="col-md-3 border-end border-secondary"><span class="kpi-title">EMA 20 (Blanca)</span><br>Ciclo Corto. Nivel Entrada.</div>
+            <div class="col-md-3 border-end border-secondary"><span class="kpi-title" style="color:#fbbf24">EMA 50 (Amarilla)</span><br>Soporte. Nivel Salida.</div>
+            <div class="col-md-3 border-end border-secondary"><span class="kpi-title" style="color:#f87171">MACD / HIST</span><br>Barras = Aceleración.</div>
+            <div class="col-md-3"><span class="kpi-title" style="color:#ff00ff">RSI (Fuerza)</span><br>Termómetro del mercado.</div>
         </div>
     </div>
 
@@ -186,6 +190,7 @@ HTML_TEMPLATE = """
             <div class="col-md-4"><div class="buy-zone text-center"><small class="text-info fw-bold">COMPRA IDEAL</small><div class="h3 fw-bold text-white">{{ "%.2f"|format(s.buy_price or 0) }} €</div></div></div>
             <div class="col-md-4"><div class="stop-zone text-center"><small class="text-danger fw-bold">STOP LOSS</small><div class="h3 fw-bold text-white">{{ "%.2f"|format(s.stop_loss or 0) }} €</div></div></div>
         </div>
+        <div class="p-3 bg-dark rounded mb-4" style="border-left: 4px solid #00a2ff;"><b>🤖 Análisis:</b> {{ s.commentary }}</div>
         <div id="chart-{{ s.ticker }}" style="height: 600px;"></div>
     </div>
     {% endfor %}
