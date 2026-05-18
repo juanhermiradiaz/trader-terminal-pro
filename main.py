@@ -43,11 +43,13 @@ def init_db():
     conn.commit(); conn.close()
 
 def save_to_db(ticker, s):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute('''INSERT OR REPLACE INTO signals VALUES (?,?,?,?,?,?,?,?,?,?)''',
-              (ticker, s['name'], s['price_eur'], s['currency'], s['trend'], 
+    try:
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        c.execute('''INSERT OR REPLACE INTO signals VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                  (ticker, s['name'], s['price_eur'], s['currency'], s['trend'], 
                s['buy_price'], s['stop_loss'], s['commentary'], json.dumps(s['chart']), s['last_updated']))
-    conn.commit(); conn.close()
+        conn.commit(); conn.close()
+    except: pass
 
 def get_from_db():
     try:
@@ -63,16 +65,19 @@ def send_alert(msg):
         except: pass
 
 def agent_loop():
-    print("--- 💹 AGENTE EURO-PRO v9.1 (Restaurado Completo) ---")
+    print("--- 💹 AGENTE EURO-PRO v9.2 (Bootstrapping...) ---")
     init_db()
-    send_alert("🚀 Terminal Trading Pro Iniciada")
+    send_alert("🚀 Terminal Trading Pro Iniciada en Render")
     while True:
         try:
-            fx = yf.download(["EURUSD=X", "EURCAD=X"], period="1d", progress=False)['Close']
-            usd_to_eur, cad_to_eur = 0.92, 0.68
-            if not fx.empty:
-                if 'EURUSD=X' in fx: usd_to_eur = 1 / fx['EURUSD=X'].iloc[-1]
-                if 'EURCAD=X' in fx: cad_to_eur = 1 / fx['EURCAD=X'].iloc[-1]
+            # Obtener divisas con reintento
+            usd_to_eur, cad_to_eur = 0.93, 0.68
+            try:
+                fx = yf.download(["EURUSD=X", "EURCAD=X"], period="1d", progress=False)['Close']
+                if not fx.empty:
+                    if 'EURUSD=X' in fx: usd_to_eur = 1 / fx['EURUSD=X'].iloc[-1]
+                    if 'EURCAD=X' in fx: cad_to_eur = 1 / fx['EURCAD=X'].iloc[-1]
+            except: pass
 
             for ticker, info in WATCHLIST.items():
                 try:
@@ -94,18 +99,6 @@ def agent_loop():
                         col = matching[0]
                         if key.lower() == 'macd':
                             m = [c for c in matching if 's' not in c.lower() and 'h' not in c.lower()]
-                            if m: col = m[0]
-                        elif key.lower() == 'macds':
-                            m = [c for c in matching if 's' in c.lower()]
-                            if m: col = m[0]
-                        elif key.lower() == 'macdh':
-                            m = [c for c in matching if 'h' in c.lower()]
-                            if m: col = m[0]
-                        elif key.lower() == 'bbu':
-                            m = [c for c in matching if 'u' in c.lower()]
-                            if m: col = m[0]
-                        elif key.lower() == 'bbl':
-                            m = [c for c in matching if 'l' in c.lower()]
                             if m: col = m[0]
                         return [round(float(x) * mult, 2) for x in df[col].tolist()]
 
@@ -134,13 +127,18 @@ def agent_loop():
                     print(f"   ✅ {info['name']} OK.")
                 except: continue
             time.sleep(120)
-        except Exception as e: print(f"❌ Error: {e}"); time.sleep(30)
+        except Exception as e: 
+            print(f"❌ Error Global: {e}")
+            time.sleep(30)
+
+# --- ARRANQUE DEL HILO (FUERA DEL MAIN PARA RENDER) ---
+threading.Thread(target=agent_loop, daemon=True).start()
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8"><title>Terminal Pro Trader</title>
+    <meta charset="UTF-8"><title>Terminal TR PRO Cloud</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <style>
@@ -150,12 +148,12 @@ HTML_TEMPLATE = """
         .stock-card { background: #141a21; border-radius: 20px; padding: 25px; margin-bottom: 30px; border: 1px solid #232d36; }
         .buy-zone { background: rgba(0, 162, 255, 0.15); border: 2px solid #00a2ff; padding: 15px; border-radius: 12px; }
         .stop-zone { background: rgba(248, 73, 96, 0.15); border: 2px solid #f84960; padding: 15px; border-radius: 12px; }
+        .num-eur { color: #00c853; font-weight: bold; }
     </style>
 </head>
 <body>
 <div class="container py-5">
     <h1 class="fw-bold text-info text-center mb-4">Terminal de Trading Profesional</h1>
-    
     <div class="legend-card p-4 shadow">
         <div class="row text-center small">
             <div class="col-md-3 border-end border-secondary"><span class="kpi-title">EMA 20 (Blanca)</span><br>Ciclo Corto. Nivel Entrada.</div>
@@ -165,13 +163,16 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    {% if not stocks %}<div class="alert alert-info text-center">Iniciando análisis... Refresca en 30s.</div>{% endif %}
+    {% if not stocks %}
+    <div class="alert alert-info text-center">Iniciando análisis en la nube... Espera 15 segundos y refresca.</div>
+    {% endif %}
+
     {% for s in stocks %}
     <div class="stock-card">
         <div class="row align-items-center mb-4">
             <div class="col-md-4">
                 <h2 class="fw-bold mb-1">{{ s.name }}</h2>
-                <div class="h3 text-success">{{ "%.2f"|format(s.price_eur or 0) }} €</div>
+                <div class="h3 num-eur">{{ "%.2f"|format(s.price_eur or 0) }} €</div>
                 <span class="badge {% if '↑' in s.trend %}bg-success{% else %}bg-danger{% endif %}">{{ s.trend }}</span>
             </div>
             <div class="col-md-4"><div class="buy-zone text-center"><small class="text-info fw-bold">COMPRA IDEAL</small><div class="h3 fw-bold text-white">{{ "%.2f"|format(s.buy_price or 0) }} €</div></div></div>
@@ -182,7 +183,6 @@ HTML_TEMPLATE = """
     </div>
     {% endfor %}
 </div>
-
 <script>
     const stocks = {{ stocks|tojson }};
     stocks.forEach(s => {
@@ -220,6 +220,5 @@ def index():
     return render_template_string(HTML_TEMPLATE, stocks=get_from_db())
 
 if __name__ == '__main__':
-    threading.Thread(target=agent_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
