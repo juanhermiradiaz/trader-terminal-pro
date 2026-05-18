@@ -14,6 +14,7 @@ import pandas_ta as ta
 app = Flask(__name__)
 
 # --- CONFIGURACIÓN DE RUTA ---
+# En Render, /tmp es el único lugar con garantía de escritura en el plan gratuito
 if os.path.exists("/tmp"):
     DB_PATH = "/tmp/tr_terminal.db"
 else:
@@ -29,14 +30,14 @@ WATCHLIST = {
     "TSM": {"name": "TSMC (ADR)"}
 }
 
-# --- CONFIGURACIÓN DE SEGURIDAD (Render) ---
+# Configuración de Alertas
 TG_TOKEN = os.getenv("TG_TOKEN", "")   
 TG_CHATID = os.getenv("TG_CHATID", "")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute('DROP TABLE IF EXISTS signals') 
-    c.execute('''CREATE TABLE signals 
+    # No borramos la tabla, solo nos aseguramos de que exista
+    c.execute('''CREATE TABLE IF NOT EXISTS signals 
                  (ticker TEXT PRIMARY KEY, name TEXT, price_eur REAL, currency TEXT,
                   trend TEXT, buy_price REAL, stop_loss REAL, commentary TEXT, 
                   chart_json TEXT, last_updated TEXT)''')
@@ -45,14 +46,12 @@ def init_db():
 def save_to_db(ticker, s):
     try:
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute('''INSERT OR REPLACE INTO signals 
-                     (ticker, name, price_eur, currency, trend, buy_price, stop_loss, commentary, chart_json, last_updated)
-                     VALUES (?,?,?,?,?,?,?,?,?,?)''',
+        c.execute('''INSERT OR REPLACE INTO signals VALUES (?,?,?,?,?,?,?,?,?,?)''',
                   (ticker, s['name'], s['price_eur'], s['currency'], s['trend'], 
                    s['buy_price'], s['stop_loss'], s['commentary'], json.dumps(s['chart']), s['last_updated']))
         conn.commit(); conn.close()
     except Exception as e:
-        print(f"   ❌ Error al guardar en DB {ticker}: {e}")
+        print(f"Error DB: {e}")
 
 def get_from_db():
     try:
@@ -62,21 +61,19 @@ def get_from_db():
         return [dict(r) for r in rows]
     except: return []
 
-def send_alert(msg):
-    if TG_TOKEN and TG_CHATID:
-        try: requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data={"chat_id": TG_CHATID, "text": msg}, timeout=10)
-        except: pass
-
 def agent_loop():
-    print("--- 💹 AGENTE EURO-PRO v9.3 INICIADO ---")
+    print("--- 💹 AGENTE EURO-PRO v9.4 (Cloud Optimization) ---")
     init_db()
-    send_alert("🚀 Terminal Trading Pro ONLINE en Render")
+    
+    # ESPERA DE CORTESÍA: Permite que Flask arranque y Render valide el puerto
+    print("⏳ Esperando 30s para el primer análisis...")
+    time.sleep(30)
     
     while True:
         try:
             print(f"📡 [{datetime.now().strftime('%H:%M:%S')}] Escaneando mercado...")
             
-            # Tipos de cambio
+            # Obtener divisas
             usd_to_eur, cad_to_eur = 0.92, 0.68
             try:
                 fx = yf.download(["EURUSD=X", "EURCAD=X"], period="1d", progress=False)['Close']
@@ -89,9 +86,7 @@ def agent_loop():
                 try:
                     stock = yf.Ticker(ticker)
                     df = stock.history(period="1y")
-                    if df.empty or len(df) < 35:
-                        print(f"   ⚠️ {info['name']}: Datos insuficientes")
-                        continue
+                    if df.empty or len(df) < 35: continue
                     
                     df = df.ffill().fillna(0)
                     df.ta.rsi(length=14, append=True)
@@ -100,7 +95,6 @@ def agent_loop():
                     df.ta.ema(length=50, append=True)
                     df.ta.bbands(length=20, append=True)
                     
-                    # Identificar cambio de moneda
                     rate = usd_to_eur if ticker in ["BABA", "NVDA", "TSM", "ATAI"] else cad_to_eur if "TO" in ticker else 1.0
                     
                     def get_safe_col(df, key, mult=1.0):
@@ -114,17 +108,16 @@ def agent_loop():
 
                     limit = 60
                     dates = df.index.strftime('%Y-%m-%d').tolist()[-limit:]
-                    prices = [round(float(x) * rate, 2) for x in df['Close'].tolist()[-limit:]]
+                    prices = [round(float(x) * rate, 2) for x in df['Close'].tolist()][-limit:]
                     ema20_l = get_safe_col(df, 'EMA_20', rate)[-limit:]
                     ema50_l = get_safe_col(df, 'EMA_50', rate)[-limit:]
                     rsi_l = get_safe_col(df, 'RSI')[-limit:]
                     
-                    status = "Alcista ↑" if prices[-1] > ema20_l[-1] else "Bajista ↓"
-                    
                     data = {
                         'name': info['name'], 'price_eur': prices[-1], 'currency': 'EUR',
-                        'trend': status, 'buy_price': round(ema20_l[-1], 2), 'stop_loss': round(ema50_l[-1] * 0.97, 2),
-                        'commentary': f"Fase {status}. RSI: {rsi_l[-1]:.1f}.",
+                        'trend': "Alcista ↑" if prices[-1] > ema20_l[-1] else "Bajista ↓",
+                        'buy_price': round(ema20_l[-1], 2), 'stop_loss': round(ema50_l[-1] * 0.97, 2),
+                        'commentary': f"Ref: {prices[-1]:.2f}€. RSI: {rsi_l[-1]:.1f}.",
                         'last_updated': datetime.now().strftime("%H:%M:%S"),
                         'chart': {
                             'dates': dates, 'prices': prices, 'ema20': ema20_l, 'ema50': ema50_l,
@@ -135,23 +128,23 @@ def agent_loop():
                     }
                     save_to_db(ticker, data)
                     print(f"   ✅ {info['name']} guardado.")
-                except Exception as e:
-                    print(f"   ❌ Error en {ticker}: {e}")
-
-            print(f"--- ✨ Ciclo completado. Siguiente en 2 min ---")
+                except: continue
+            
+            print(f"--- ✨ Ciclo completado. Esperando 2 min. ---")
             time.sleep(120)
+            
         except Exception as e: 
             print(f"❌ Error Crítico: {e}")
             time.sleep(30)
 
-# Lanzar el hilo del agente
+# Lanzar el hilo del agente (Fuera del if name == main para Gunicorn)
 threading.Thread(target=agent_loop, daemon=True).start()
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8"><title>Terminal TR PRO Cloud</title>
+    <meta charset="UTF-8"><title>Terminal Pro Trader</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <style>
@@ -176,7 +169,10 @@ HTML_TEMPLATE = """
     </div>
 
     {% if not stocks %}
-    <div class="alert alert-info text-center">Analizando mercados en tiempo real... Refresca en 15 segundos.</div>
+    <div class="alert alert-info text-center">
+        <div class="spinner-border spinner-border-sm me-2"></div>
+        Agente iniciado. Analizando mercados... Refresca esta página en 1 minuto.
+    </div>
     {% endif %}
 
     {% for s in stocks %}
