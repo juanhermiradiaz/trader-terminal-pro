@@ -13,11 +13,7 @@ import pandas_ta as ta
 
 app = Flask(__name__)
 
-# --- CONFIGURACIÓN DE SEGURIDAD (Render) ---
-TG_TOKEN = os.getenv("TG_TOKEN", "")   
-TG_CHATID = os.getenv("TG_CHATID", "")
-
-# Configuración de ruta de base de datos
+# --- CONFIGURACIÓN DE RUTA ---
 if os.path.exists("/tmp"):
     DB_PATH = "/tmp/tr_terminal.db"
 else:
@@ -33,6 +29,10 @@ WATCHLIST = {
     "TSM": {"name": "TSMC (ADR)"}
 }
 
+# --- CONFIGURACIÓN DE SEGURIDAD (Render) ---
+TG_TOKEN = os.getenv("TG_TOKEN", "")   
+TG_CHATID = os.getenv("TG_CHATID", "")
+
 def init_db():
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute('DROP TABLE IF EXISTS signals') 
@@ -45,11 +45,14 @@ def init_db():
 def save_to_db(ticker, s):
     try:
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-        c.execute('''INSERT OR REPLACE INTO signals VALUES (?,?,?,?,?,?,?,?,?,?)''',
+        c.execute('''INSERT OR REPLACE INTO signals 
+                     (ticker, name, price_eur, currency, trend, buy_price, stop_loss, commentary, chart_json, last_updated)
+                     VALUES (?,?,?,?,?,?,?,?,?,?)''',
                   (ticker, s['name'], s['price_eur'], s['currency'], s['trend'], 
-               s['buy_price'], s['stop_loss'], s['commentary'], json.dumps(s['chart']), s['last_updated']))
+                   s['buy_price'], s['stop_loss'], s['commentary'], json.dumps(s['chart']), s['last_updated']))
         conn.commit(); conn.close()
-    except: pass
+    except Exception as e:
+        print(f"   ❌ Error al guardar en DB {ticker}: {e}")
 
 def get_from_db():
     try:
@@ -65,13 +68,16 @@ def send_alert(msg):
         except: pass
 
 def agent_loop():
-    print("--- 💹 AGENTE EURO-PRO v9.2 (Bootstrapping...) ---")
+    print("--- 💹 AGENTE EURO-PRO v9.3 INICIADO ---")
     init_db()
-    send_alert("🚀 Terminal Trading Pro Iniciada en Render")
+    send_alert("🚀 Terminal Trading Pro ONLINE en Render")
+    
     while True:
         try:
-            # Obtener divisas con reintento
-            usd_to_eur, cad_to_eur = 0.93, 0.68
+            print(f"📡 [{datetime.now().strftime('%H:%M:%S')}] Escaneando mercado...")
+            
+            # Tipos de cambio
+            usd_to_eur, cad_to_eur = 0.92, 0.68
             try:
                 fx = yf.download(["EURUSD=X", "EURCAD=X"], period="1d", progress=False)['Close']
                 if not fx.empty:
@@ -83,7 +89,10 @@ def agent_loop():
                 try:
                     stock = yf.Ticker(ticker)
                     df = stock.history(period="1y")
-                    if df.empty or len(df) < 35: continue
+                    if df.empty or len(df) < 35:
+                        print(f"   ⚠️ {info['name']}: Datos insuficientes")
+                        continue
+                    
                     df = df.ffill().fillna(0)
                     df.ta.rsi(length=14, append=True)
                     df.ta.macd(append=True)
@@ -91,6 +100,7 @@ def agent_loop():
                     df.ta.ema(length=50, append=True)
                     df.ta.bbands(length=20, append=True)
                     
+                    # Identificar cambio de moneda
                     rate = usd_to_eur if ticker in ["BABA", "NVDA", "TSM", "ATAI"] else cad_to_eur if "TO" in ticker else 1.0
                     
                     def get_safe_col(df, key, mult=1.0):
@@ -104,7 +114,7 @@ def agent_loop():
 
                     limit = 60
                     dates = df.index.strftime('%Y-%m-%d').tolist()[-limit:]
-                    prices = [round(float(x) * rate, 2) for x in df['Close'].tolist()][-limit:]
+                    prices = [round(float(x) * rate, 2) for x in df['Close'].tolist()[-limit:]]
                     ema20_l = get_safe_col(df, 'EMA_20', rate)[-limit:]
                     ema50_l = get_safe_col(df, 'EMA_50', rate)[-limit:]
                     rsi_l = get_safe_col(df, 'RSI')[-limit:]
@@ -124,14 +134,17 @@ def agent_loop():
                         }
                     }
                     save_to_db(ticker, data)
-                    print(f"   ✅ {info['name']} OK.")
-                except: continue
+                    print(f"   ✅ {info['name']} guardado.")
+                except Exception as e:
+                    print(f"   ❌ Error en {ticker}: {e}")
+
+            print(f"--- ✨ Ciclo completado. Siguiente en 2 min ---")
             time.sleep(120)
         except Exception as e: 
-            print(f"❌ Error Global: {e}")
+            print(f"❌ Error Crítico: {e}")
             time.sleep(30)
 
-# --- ARRANQUE DEL HILO (FUERA DEL MAIN PARA RENDER) ---
+# Lanzar el hilo del agente
 threading.Thread(target=agent_loop, daemon=True).start()
 
 HTML_TEMPLATE = """
@@ -148,23 +161,22 @@ HTML_TEMPLATE = """
         .stock-card { background: #141a21; border-radius: 20px; padding: 25px; margin-bottom: 30px; border: 1px solid #232d36; }
         .buy-zone { background: rgba(0, 162, 255, 0.15); border: 2px solid #00a2ff; padding: 15px; border-radius: 12px; }
         .stop-zone { background: rgba(248, 73, 96, 0.15); border: 2px solid #f84960; padding: 15px; border-radius: 12px; }
-        .num-eur { color: #00c853; font-weight: bold; }
     </style>
 </head>
 <body>
 <div class="container py-5">
     <h1 class="fw-bold text-info text-center mb-4">Terminal de Trading Profesional</h1>
-    <div class="legend-card p-4 shadow">
-        <div class="row text-center small">
-            <div class="col-md-3 border-end border-secondary"><span class="kpi-title">EMA 20 (Blanca)</span><br>Ciclo Corto. Nivel Entrada.</div>
-            <div class="col-md-3 border-end border-secondary"><span class="kpi-title" style="color:#fbbf24">EMA 50 (Amarilla)</span><br>Soporte. Nivel Salida.</div>
-            <div class="col-md-3 border-end border-secondary"><span class="kpi-title" style="color:#f87171">MACD / HIST</span><br>Barras = Aceleración.</div>
-            <div class="col-md-3"><span class="kpi-title" style="color:#ff00ff">RSI (Fuerza)</span><br>Termómetro del mercado.</div>
+    <div class="legend-card p-4 shadow text-center">
+        <div class="row">
+            <div class="col-md-3 border-end border-secondary"><span class="kpi-title">EMA 20 (Blanca)</span><br><small>Entrada Corto Plazo.</small></div>
+            <div class="col-md-3 border-end border-secondary"><span class="kpi-title" style="color:#fbbf24">EMA 50 (Amarilla)</span><br><small>Soporte de Seguridad.</small></div>
+            <div class="col-md-3 border-end border-secondary"><span class="kpi-title" style="color:#f87171">MACD / HIST</span><br><small>Barras = Aceleración.</small></div>
+            <div class="col-md-3"><span class="kpi-title" style="color:#ff00ff">RSI (Fuerza)</span><br><small>Fuerza del mercado.</small></div>
         </div>
     </div>
 
     {% if not stocks %}
-    <div class="alert alert-info text-center">Iniciando análisis en la nube... Espera 15 segundos y refresca.</div>
+    <div class="alert alert-info text-center">Analizando mercados en tiempo real... Refresca en 15 segundos.</div>
     {% endif %}
 
     {% for s in stocks %}
@@ -172,13 +184,12 @@ HTML_TEMPLATE = """
         <div class="row align-items-center mb-4">
             <div class="col-md-4">
                 <h2 class="fw-bold mb-1">{{ s.name }}</h2>
-                <div class="h3 num-eur">{{ "%.2f"|format(s.price_eur or 0) }} €</div>
+                <div class="h3 text-success">{{ "%.2f"|format(s.price_eur or 0) }} €</div>
                 <span class="badge {% if '↑' in s.trend %}bg-success{% else %}bg-danger{% endif %}">{{ s.trend }}</span>
             </div>
             <div class="col-md-4"><div class="buy-zone text-center"><small class="text-info fw-bold">COMPRA IDEAL</small><div class="h3 fw-bold text-white">{{ "%.2f"|format(s.buy_price or 0) }} €</div></div></div>
             <div class="col-md-4"><div class="stop-zone text-center"><small class="text-danger fw-bold">STOP LOSS</small><div class="h3 fw-bold text-white">{{ "%.2f"|format(s.stop_loss or 0) }} €</div></div></div>
         </div>
-        <div class="p-3 bg-dark rounded mb-4" style="border-left: 4px solid #00a2ff;"><b>🤖 Análisis:</b> {{ s.commentary }}</div>
         <div id="chart-{{ s.ticker }}" style="height: 600px;"></div>
     </div>
     {% endfor %}
