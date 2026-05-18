@@ -13,10 +13,11 @@ import pandas_ta as ta
 
 app = Flask(__name__)
 
-# --- CONFIGURACIÓN DE RUTA ABSOLUTA PARA RENDER ---
-if os.name == 'nt': # Windows local
+# --- CONFIGURACIÓN DE RUTA ABSOLUTA ---
+# Usamos una ruta fija y absoluta para que no haya dudas de dónde está el archivo
+if os.name == 'nt':
     DB_PATH = os.path.join(os.getcwd(), "tr_terminal.db")
-else: # Linux / Render
+else:
     DB_PATH = "/tmp/tr_terminal.db"
 
 WATCHLIST = {
@@ -29,7 +30,6 @@ WATCHLIST = {
     "TSM": {"name": "TSMC (ADR)"}
 }
 
-# --- MOTOR DE BASE DE DATOS ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -46,7 +46,7 @@ def save_to_db(ticker, s):
         c = conn.cursor()
         c.execute('''INSERT OR REPLACE INTO signals VALUES (?,?,?,?,?,?,?,?,?,?)''',
                   (ticker, s['name'], s['price_eur'], s['currency'], s['trend'], 
-                   s['buy_price'], s['stop_loss'], s['commentary'], json.dumps(s['chart']), s['last_updated']))
+               s['buy_price'], s['stop_loss'], s['commentary'], json.dumps(s['chart']), s['last_updated']))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -59,120 +59,85 @@ def get_from_db():
         rows = conn.execute('SELECT * FROM signals ORDER BY name ASC').fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    except:
+    except Exception as e:
         return []
 
-# --- AGENTE EN SEGUNDO PLANO ---
 def agent_loop():
-    print(f"--- 💹 AGENTE INICIADO (DB: {DB_PATH}) ---")
+    print(f"--- 💹 AGENTE INICIADO EN: {DB_PATH} ---")
     init_db()
-    
-    # Pausa inicial para dejar que el servidor web respire
-    time.sleep(10)
-    
     while True:
         try:
-            print(f"📡 [{datetime.now().strftime('%H:%M:%S')}] Escaneando mercado...")
-            
-            # Obtener divisas
-            usd_to_eur, cad_to_eur = 0.92, 0.68
-            try:
-                fx = yf.download(["EURUSD=X", "EURCAD=X"], period="1d", progress=False)['Close']
-                if not fx.empty:
-                    if 'EURUSD=X' in fx: usd_to_eur = 1 / fx['EURUSD=X'].iloc[-1]
-                    if 'EURCAD=X' in fx: cad_to_eur = 1 / fx['EURCAD=X'].iloc[-1]
-            except: pass
+            fx = yf.download(["EURUSD=X", "EURCAD=X"], period="1d", progress=False)['Close']
+            u_e, c_e = 0.92, 0.68
+            if not fx.empty:
+                if 'EURUSD=X' in fx: u_e = 1 / fx['EURUSD=X'].iloc[-1]
+                if 'EURCAD=X' in fx: c_e = 1 / fx['EURCAD=X'].iloc[-1]
 
             for ticker, info in WATCHLIST.items():
                 try:
                     stock = yf.Ticker(ticker)
                     df = stock.history(period="1y")
                     if df.empty or len(df) < 35: continue
-                    
                     df = df.ffill().fillna(0)
-                    df.ta.rsi(length=14, append=True)
-                    df.ta.macd(append=True)
-                    df.ta.ema(length=20, append=True)
-                    df.ta.ema(length=50, append=True)
-                    df.ta.bbands(length=20, append=True)
+                    df.ta.rsi(append=True); df.ta.macd(append=True); df.ta.ema(length=20, append=True); df.ta.ema(length=50, append=True); df.ta.bbands(append=True)
                     
-                    rate = usd_to_eur if ticker in ["BABA", "NVDA", "TSM", "ATAI"] else cad_to_eur if "TO" in ticker else 1.0
+                    rate = u_e if ticker in ["BABA", "NVDA", "TSM", "ATAI"] else c_e if "TO" in ticker else 1.0
                     
-                    def get_safe_col(df, key, mult=1.0):
-                        matching = [c for c in df.columns if key.lower() in c.lower()]
-                        if not matching: return [0.0] * len(df)
-                        col = matching[0]
-                        if key.lower() == 'macd':
-                            m = [c for c in matching if 's' not in c.lower() and 'h' not in c.lower()]
-                            if m: col = m[0]
-                        return [round(float(x) * mult, 2) for x in df[col].tolist()]
+                    def gc(df, k, m=1.0):
+                        match = [c for c in df.columns if k.lower() in c.lower()]
+                        col = match[0]
+                        if k.lower() == 'macd':
+                            m_pure = [c for c in match if 's' not in c.lower() and 'h' not in c.lower()]
+                            if m_pure: col = m_pure[0]
+                        return [round(float(x)*m, 2) for x in df[col].fillna(0).tolist()[-60:]]
 
-                    limit = 60
-                    dates = df.index.strftime('%Y-%m-%d').tolist()[-limit:]
-                    prices = [round(float(x) * rate, 2) for x in df['Close'].tolist()[-limit:]]
-                    ema20_l = get_safe_col(df, 'EMA_20', rate)[-limit:]
-                    ema50_l = get_safe_col(df, 'EMA_50', rate)[-limit:]
-                    rsi_l = get_safe_col(df, 'RSI')[-limit:]
+                    p_eur = (stock.fast_info.get('last_price') or df['Close'].iloc[-1]) * rate
+                    ema20 = gc(df, 'EMA_20', rate)
+                    ema50 = gc(df, 'EMA_50', rate)
                     
                     data = {
-                        'name': info['name'], 'price_eur': prices[-1], 'currency': 'EUR',
-                        'trend': "Alcista ↑" if prices[-1] > ema20_l[-1] else "Bajista ↓",
-                        'buy_price': round(ema20_l[-1], 2), 'stop_loss': round(ema50_l[-1] * 0.97, 2),
-                        'commentary': f"Ref: {prices[-1]:.2f}€. RSI: {rsi_l[-1]:.1f}.",
+                        'name': info['name'], 'price_eur': p_eur, 'currency': 'EUR',
+                        'trend': "Alcista ↑" if p_eur > ema20[-1] else "Bajista ↓",
+                        'buy_price': round(ema20[-1], 2), 'stop_loss': round(ema50[-1]*0.97, 2),
+                        'commentary': f"Actualizado a las {datetime.now().strftime('%H:%M')}",
                         'last_updated': datetime.now().strftime("%H:%M:%S"),
                         'chart': {
-                            'dates': dates, 'prices': prices, 'ema20': ema20_l, 'ema50': ema50_l,
-                            'rsi': rsi_l, 'macd': get_safe_col(df, 'macd', rate)[-limit:],
-                            'macds': get_safe_col(df, 'macds', rate)[-limit:], 'macdh': get_safe_col(df, 'macdh', rate)[-limit:],
-                            'bbu': get_safe_col(df, 'BBU', rate)[-limit:], 'bbl': get_safe_col(df, 'BBL', rate)[-limit:]
+                            'dates': df.index.strftime('%Y-%m-%d').tolist()[-60:],
+                            'prices': [round(x*rate, 2) for x in df['Close'].tolist()[-60:]],
+                            'ema20': ema20, 'ema50': ema50, 'rsi': gc(df, 'RSI'),
+                            'macd': gc(df, 'macd', rate), 'macds': gc(df, 'macds', rate), 'macdh': gc(df, 'macdh', rate),
+                            'bbu': gc(df, 'BBU', rate), 'bbl': gc(df, 'BBL', rate)
                         }
                     }
                     save_to_db(ticker, data)
                     print(f"   ✅ {info['name']} guardado.")
-                except Exception as e:
-                    print(f"   ❌ Error en {ticker}: {e}")
-            
-            print(f"--- ✨ Ciclo completado. Siguiente en 2 min ---")
+                except: continue
             time.sleep(120)
-        except Exception as e: 
-            print(f"❌ Error Agente: {e}")
-            time.sleep(30)
+        except: time.sleep(30)
 
-# Lanzar el agente (Fuera del if name == main)
 threading.Thread(target=agent_loop, daemon=True).start()
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8"><title>Terminal PRO Trader</title>
+    <meta charset="UTF-8"><title>Terminal PRO Cloud</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <style>
         body { background: #0b0e14; color: #e2e8f0; font-family: sans-serif; }
-        .legend-card { background: #141a21; border: 1px solid #334155; border-radius: 12px; margin-bottom: 30px; }
-        .kpi-title { font-weight: bold; font-size: 0.8rem; color: #ffffff !important; }
         .stock-card { background: #141a21; border-radius: 20px; padding: 25px; margin-bottom: 30px; border: 1px solid #232d36; }
-        .buy-zone { background: rgba(0, 162, 255, 0.15); border: 2px solid #00a2ff; padding: 15px; border-radius: 12px; }
-        .stop-zone { background: rgba(248, 73, 96, 0.15); border: 2px solid #f84960; padding: 15px; border-radius: 12px; }
+        .debug-panel { background: #000; border: 1px solid #ff00ff; padding: 10px; font-family: monospace; font-size: 0.7rem; color: #ff00ff; }
     </style>
 </head>
 <body>
 <div class="container py-5">
-    <h1 class="fw-bold text-info text-center mb-4">Terminal de Trading Profesional</h1>
-    <div class="legend-card p-4 shadow text-center">
-        <div class="row">
-            <div class="col-md-3 border-end border-secondary"><span class="kpi-title">EMA 20 (Blanca)</span><br><small>Entrada Corto Plazo.</small></div>
-            <div class="col-md-3 border-end border-secondary"><span class="kpi-title" style="color:#fbbf24">EMA 50 (Amarilla)</span><br><small>Soporte de Seguridad.</small></div>
-            <div class="col-md-3 border-end border-secondary"><span class="kpi-title" style="color:#f87171">MACD / HIST</span><br><small>Barras = Aceleración.</small></div>
-            <div class="col-md-3"><span class="kpi-title" style="color:#ff00ff">RSI (Fuerza)</span><br><small>Fuerza del mercado.</small></div>
-        </div>
-    </div>
-
+    <h1 class="fw-bold text-info text-center mb-4">Terminal de Trading Pro</h1>
+    
     {% if not stocks %}
-    <div class="alert alert-info text-center">
-        <div class="spinner-border spinner-border-sm me-2"></div>
-        Analizando mercados... La primera carga tarda unos 30 segundos. <b>Refresca esta página ahora</b>.
+    <div class="alert alert-warning text-center">
+        🔎 <b>Estado:</b> El agente está analizando el mercado por primera vez.<br>
+        Espera 20 segundos y <b>pulsa F5</b>.
     </div>
     {% endif %}
 
@@ -184,12 +149,25 @@ HTML_TEMPLATE = """
                 <div class="h3 text-success">{{ "%.2f"|format(s.price_eur or 0) }} €</div>
                 <span class="badge {% if '↑' in s.trend %}bg-success{% else %}bg-danger{% endif %}">{{ s.trend }}</span>
             </div>
-            <div class="col-md-4"><div class="buy-zone text-center"><small class="text-info fw-bold uppercase">COMPRA IDEAL</small><div class="h3 fw-bold text-white">{{ "%.2f"|format(s.buy_price or 0) }} €</div></div></div>
-            <div class="col-md-4"><div class="stop-zone text-center"><small class="text-danger fw-bold uppercase">STOP LOSS</small><div class="h3 fw-bold text-white">{{ "%.2f"|format(s.stop_loss or 0) }} €</div></div></div>
+            <div class="col-md-4 text-center">
+                <div class="text-info small fw-bold uppercase">COMPRA IDEAL</div>
+                <div class="h3 fw-bold text-white">{{ s.buy_price }} €</div>
+            </div>
+            <div class="col-md-4 text-center">
+                <div class="text-danger small fw-bold uppercase">STOP LOSS</div>
+                <div class="h3 fw-bold text-white">{{ s.stop_loss }} €</div>
+            </div>
         </div>
         <div id="chart-{{ s.ticker }}" style="height: 600px;"></div>
     </div>
     {% endfor %}
+
+    <div class="debug-panel mt-5">
+        <b>[DEBUG SYSTEM STATUS]</b><br>
+        DB Path: {{ db_info.path }}<br>
+        Acciones en DB: {{ stocks|length }} / 7<br>
+        Time: {{ db_info.now }}
+    </div>
 </div>
 <script>
     const stocks = {{ stocks|tojson }};
@@ -201,17 +179,17 @@ HTML_TEMPLATE = """
                 { x: c.dates, y: c.ema20, name: 'EMA20', type: 'scatter', line: {color: '#fff', dash: 'dot'}, yaxis: 'y' },
                 { x: c.dates, y: c.ema50, name: 'EMA50', type: 'scatter', line: {color: '#fbbf24', dash: 'dot'}, yaxis: 'y' },
                 { x: c.dates, y: c.bbu, name: 'BBU', type: 'scatter', line: {color: 'rgba(255,255,255,0.1)'}, yaxis: 'y' },
-                { x: c.dates, y: c.bbl, name: 'BBL', type: 'scatter', line: {color: 'rgba(255,255,255,0.1)'}, fill: 'tonexty', fillcolor: 'rgba(255,255,255,0.03)', yaxis: 'y' },
+                { x: c.dates, y: c.bbl, name: 'BBL', type: 'scatter', line: {color: 'rgba(255,255,255,0.1)'}, fill: 'tonexty', yaxis: 'y' },
                 { x: c.dates, y: c.macd, name: 'MACD', type: 'scatter', line: {color: '#fbbf24'}, yaxis: 'y2' },
                 { x: c.dates, y: c.macds, name: 'Señal', type: 'scatter', line: {color: '#f84960'}, yaxis: 'y2' },
                 { x: c.dates, y: c.macdh, name: 'Hist', type: 'bar', marker: {color: 'rgba(56,189,248,0.5)'}, yaxis: 'y2' },
                 { x: c.dates, y: c.rsi, name: 'RSI', type: 'scatter', line: {color: '#ff00ff'}, yaxis: 'y3' }
             ];
-            Plotly.newPlot('chart-' + s.ticker, traces, {
+            Plotly.newPlot('chart-' + s.ticker.replace('.','-'), traces, {
                 grid: { rows: 3, cols: 1, pattern: 'independent', roworder: 'top to bottom' },
                 paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
                 showlegend: false, margin: {t:10, b:40, l:50, r:10},
-                xaxis: { gridcolor: '#222', tickfont: {color: '#777'} },
+                xaxis: { gridcolor: '#222' },
                 yaxis: { domain: [0.6, 1], gridcolor: '#222' },
                 yaxis2: { domain: [0.3, 0.55], gridcolor: '#222' },
                 yaxis3: { domain: [0, 0.25], gridcolor: '#222', range: [0, 100] }
@@ -225,7 +203,9 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE, stocks=get_from_db())
+    stocks = get_from_db()
+    db_info = {"path": DB_PATH, "now": datetime.now().strftime("%H:%M:%S")}
+    return render_template_string(HTML_TEMPLATE, stocks=stocks, db_info=db_info)
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
