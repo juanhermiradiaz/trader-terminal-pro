@@ -357,7 +357,7 @@ def analyze_stock(identifier):
         elif rsi_val > 65:
             args.append(f"RSI en {rsi_val:.1f} (Sobrecompra). Riesgo de corrección.")
 
-        rec = "MANTENER"
+        rec = "NEUTRAL"
         if trend_status == "ALCISTA" and rsi_val < 60 and macd[-1] > macds[-1]: rec = "COMPRA"
         if trend_status == "BAJISTA" and rsi_val > 65: rec = "VENTA"
         if rsi_val < 30: rec = "COMPRA (Rebote)"
@@ -418,7 +418,7 @@ HTML_TEMPLATE = """
         .arg-box { background: #1c2630; border-radius: 10px; padding: 15px; border-left: 4px solid #38bdf8; }
         .rec-COMPRA { color: #02c076; font-weight: bold; }
         .rec-VENTA { color: #f84960; font-weight: bold; }
-        .rec-MANTENER { color: #fbbf24; font-weight: bold; }
+        .rec-NEUTRAL { color: #fbbf24; font-weight: bold; }
     </style>
 </head>
 <body>
