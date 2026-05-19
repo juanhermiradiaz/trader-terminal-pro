@@ -36,15 +36,41 @@ def _refresh_yf_session():
     session = requests.Session()
     session.headers.update({
         "User-Agent": _YF_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
         "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     })
 
     def _valid_crumb(text):
         """A crumb is a short token, never HTML."""
-        return text and 3 < len(text) < 50 and "<" not in text
+        return text and 3 < len(text) < 200 and "<" not in text
+
+    def _try_consent(resp):
+        """Auto-submit GDPR consent form if Yahoo redirected to consent page."""
+        try:
+            text = resp.text
+            if "csrfToken" not in text:
+                return
+            csrf = re.search(r'name=["\']csrfToken["\']\s+value=["\']([^"\']+)["\']', text)
+            sess_id = re.search(r'name=["\']sessionId["\']\s+value=["\']([^"\']+)["\']', text)
+            if csrf and sess_id:
+                session.post(
+                    "https://consent.yahoo.com/v2/collectConsent",
+                    params={"sessionId": sess_id.group(1)},
+                    data={
+                        "csrfToken": csrf.group(1),
+                        "sessionId": sess_id.group(1),
+                        "originalDoneUrl": "https://finance.yahoo.com/",
+                        "namespace": "yahoo",
+                        "agree": ["agree", "agree"],
+                    },
+                    timeout=10, verify=_YF_VERIFY_SSL,
+                )
+        except Exception:
+            pass
 
     def _try_getcrumb():
         for host in ("query2", "query1"):
@@ -59,11 +85,24 @@ def _refresh_yf_session():
                 pass
         return None
 
+    def _extract_crumb_from_page(text):
+        m = re.search(r'"crumb"\s*:\s*"([^"]{5,}?)"', text)
+        if m:
+            candidate = m.group(1)
+            try:
+                candidate = candidate.encode("utf-8").decode("unicode_escape")
+            except Exception:
+                pass
+            if _valid_crumb(candidate):
+                return candidate
+        return None
+
     crumb = None
 
-    # Strategy 1: visit finance.yahoo.com homepage first, then getcrumb
+    # Strategy 1: visit finance.yahoo.com homepage (auto-handles GDPR consent), then getcrumb
     try:
-        session.get("https://finance.yahoo.com/", timeout=15, verify=_YF_VERIFY_SSL)
+        r = session.get("https://finance.yahoo.com/", timeout=15, verify=_YF_VERIFY_SSL)
+        _try_consent(r)
         crumb = _try_getcrumb()
     except Exception:
         pass
@@ -75,13 +114,8 @@ def _refresh_yf_session():
                 "https://finance.yahoo.com/quote/AAPL",
                 timeout=15, verify=_YF_VERIFY_SSL,
             )
-            crumb = _try_getcrumb()
-            if not crumb:
-                m = re.search(r'"crumb"\s*:\s*"([^"]{5,20})"', page.text)
-                if m:
-                    candidate = m.group(1).encode("utf-8").decode("unicode_escape")
-                    if _valid_crumb(candidate):
-                        crumb = candidate
+            _try_consent(page)
+            crumb = _try_getcrumb() or _extract_crumb_from_page(page.text)
         except Exception:
             pass
 
@@ -93,17 +127,25 @@ def _refresh_yf_session():
                 "https://finance.yahoo.com/quote/AAPL",
                 timeout=15, verify=_YF_VERIFY_SSL,
             )
-            crumb = _try_getcrumb()
-            if not crumb:
-                m = re.search(r'"crumb"\s*:\s*"([^"]{5,20})"', page.text)
-                if m:
-                    candidate = m.group(1).encode("utf-8").decode("unicode_escape")
-                    if _valid_crumb(candidate):
-                        crumb = candidate
+            _try_consent(page)
+            crumb = _try_getcrumb() or _extract_crumb_from_page(page.text)
         except Exception:
             pass
 
+    # Strategy 4: probe chart API without crumb — works on many US cloud IPs
     if not crumb:
+        try:
+            r = session.get(
+                "https://query2.finance.yahoo.com/v8/finance/chart/AAPL",
+                params={"range": "1d", "interval": "1h", "includePrePost": "false"},
+                timeout=12, verify=_YF_VERIFY_SSL,
+            )
+            if r.status_code == 200:
+                crumb = ""  # crumb-less mode — API responded without it
+        except Exception:
+            pass
+
+    if crumb is None:
         raise RuntimeError("No se pudo obtener el crumb de Yahoo Finance")
 
     _YF_SESSION = session
@@ -113,7 +155,7 @@ def _refresh_yf_session():
 
 def _get_yf_session():
     global _YF_SESSION, _YF_CRUMB
-    if _YF_SESSION and _YF_CRUMB:
+    if _YF_SESSION is not None and _YF_CRUMB is not None:
         return _YF_SESSION, _YF_CRUMB
     return _refresh_yf_session()
 
@@ -122,13 +164,14 @@ def _yf_chart(ticker, range_="1y", interval="1d"):
     """Fetch Yahoo Finance chart data. Retries once on auth error."""
     for attempt in range(2):
         session, crumb = _get_yf_session()
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
         params = {
             "range": range_,
             "interval": interval,
-            "crumb": crumb,
             "includePrePost": "false",
         }
+        if crumb:  # omit crumb param in crumb-less mode
+            params["crumb"] = crumb
         resp = session.get(url, params=params, timeout=15, verify=_YF_VERIFY_SSL)
         if resp.status_code in (401, 403) and attempt == 0:
             _refresh_yf_session()
