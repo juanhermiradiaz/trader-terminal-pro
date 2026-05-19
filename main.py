@@ -39,35 +39,69 @@ def _refresh_yf_session():
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
     })
 
-    # Hit a quote page (not the homepage) to reliably set auth cookies
-    init_resp = session.get(
-        "https://finance.yahoo.com/quote/AAPL",
-        timeout=10,
-        verify=_YF_VERIFY_SSL,
-    )
+    def _valid_crumb(text):
+        """A crumb is a short token, never HTML."""
+        return text and 3 < len(text) < 50 and "<" not in text
 
-    # Try query1 first (more permissive), then query2
+    def _try_getcrumb():
+        for host in ("query2", "query1"):
+            try:
+                r = session.get(
+                    f"https://{host}.finance.yahoo.com/v1/test/getcrumb",
+                    timeout=10, verify=_YF_VERIFY_SSL,
+                )
+                if r.status_code == 200 and _valid_crumb(r.text.strip()):
+                    return r.text.strip()
+            except Exception:
+                pass
+        return None
+
     crumb = None
-    for host in ("query1", "query2"):
+
+    # Strategy 1: visit finance.yahoo.com homepage first, then getcrumb
+    try:
+        session.get("https://finance.yahoo.com/", timeout=15, verify=_YF_VERIFY_SSL)
+        crumb = _try_getcrumb()
+    except Exception:
+        pass
+
+    # Strategy 2: visit a specific quote page, extract crumb from page JS
+    if not crumb:
         try:
-            r = session.get(
-                f"https://{host}.finance.yahoo.com/v1/test/getcrumb",
-                timeout=10,
-                verify=_YF_VERIFY_SSL,
+            page = session.get(
+                "https://finance.yahoo.com/quote/AAPL",
+                timeout=15, verify=_YF_VERIFY_SSL,
             )
-            if r.status_code == 200 and r.text.strip():
-                crumb = r.text.strip()
-                break
+            crumb = _try_getcrumb()
+            if not crumb:
+                m = re.search(r'"crumb"\s*:\s*"([^"]{5,20})"', page.text)
+                if m:
+                    candidate = m.group(1).encode("utf-8").decode("unicode_escape")
+                    if _valid_crumb(candidate):
+                        crumb = candidate
         except Exception:
             pass
 
-    # Fallback: extract crumb embedded in page JS state
+    # Strategy 3: fc.yahoo.com consent bypass (EU cloud IPs / GDPR flow)
     if not crumb:
-        m = re.search(r'"crumb":"([^"]+)"', init_resp.text)
-        if m:
-            crumb = m.group(1).encode("utf-8").decode("unicode_escape")
+        try:
+            session.get("https://fc.yahoo.com", timeout=10, verify=_YF_VERIFY_SSL)
+            page = session.get(
+                "https://finance.yahoo.com/quote/AAPL",
+                timeout=15, verify=_YF_VERIFY_SSL,
+            )
+            crumb = _try_getcrumb()
+            if not crumb:
+                m = re.search(r'"crumb"\s*:\s*"([^"]{5,20})"', page.text)
+                if m:
+                    candidate = m.group(1).encode("utf-8").decode("unicode_escape")
+                    if _valid_crumb(candidate):
+                        crumb = candidate
+        except Exception:
+            pass
 
     if not crumb:
         raise RuntimeError("No se pudo obtener el crumb de Yahoo Finance")
