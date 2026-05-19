@@ -1,14 +1,167 @@
 import asyncio
-import yfinance as yf
 import pandas as pd
 import json
 import os
+import time
 import requests
+import urllib3
+import re
 from flask import Flask, render_template_string, request
 from datetime import datetime
 import pandas_ta as ta
 
 app = Flask(__name__)
+
+ANALYSIS_CACHE_TTL_SECONDS = int(os.environ.get("ANALYSIS_CACHE_TTL_SECONDS", "0"))
+ANALYSIS_CACHE = {}
+
+
+# --- Yahoo Finance Direct API (crumb-based, no yfinance library) ---
+_YF_SESSION = None
+_YF_CRUMB = None
+_YF_VERIFY_SSL = os.environ.get("YF_VERIFY_SSL", "false").lower() in {"1", "true", "yes"}
+
+if not _YF_VERIFY_SSL:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+_YF_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _refresh_yf_session():
+    global _YF_SESSION, _YF_CRUMB
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": _YF_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+    })
+
+    # Hit a quote page (not the homepage) to reliably set auth cookies
+    init_resp = session.get(
+        "https://finance.yahoo.com/quote/AAPL",
+        timeout=10,
+        verify=_YF_VERIFY_SSL,
+    )
+
+    # Try query1 first (more permissive), then query2
+    crumb = None
+    for host in ("query1", "query2"):
+        try:
+            r = session.get(
+                f"https://{host}.finance.yahoo.com/v1/test/getcrumb",
+                timeout=10,
+                verify=_YF_VERIFY_SSL,
+            )
+            if r.status_code == 200 and r.text.strip():
+                crumb = r.text.strip()
+                break
+        except Exception:
+            pass
+
+    # Fallback: extract crumb embedded in page JS state
+    if not crumb:
+        m = re.search(r'"crumb":"([^"]+)"', init_resp.text)
+        if m:
+            crumb = m.group(1).encode("utf-8").decode("unicode_escape")
+
+    if not crumb:
+        raise RuntimeError("No se pudo obtener el crumb de Yahoo Finance")
+
+    _YF_SESSION = session
+    _YF_CRUMB = crumb
+    return _YF_SESSION, _YF_CRUMB
+
+
+def _get_yf_session():
+    global _YF_SESSION, _YF_CRUMB
+    if _YF_SESSION and _YF_CRUMB:
+        return _YF_SESSION, _YF_CRUMB
+    return _refresh_yf_session()
+
+
+def _yf_chart(ticker, range_="1y", interval="1d"):
+    """Fetch Yahoo Finance chart data. Retries once on auth error."""
+    for attempt in range(2):
+        session, crumb = _get_yf_session()
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        params = {
+            "range": range_,
+            "interval": interval,
+            "crumb": crumb,
+            "includePrePost": "false",
+        }
+        resp = session.get(url, params=params, timeout=15, verify=_YF_VERIFY_SSL)
+        if resp.status_code in (401, 403) and attempt == 0:
+            _refresh_yf_session()
+            continue
+        if resp.status_code == 429:
+            raise RuntimeError("rate_limit")
+        resp.raise_for_status()
+        return resp.json()
+    resp.raise_for_status()  # pragma: no cover
+
+
+def _download_history(ticker):
+    """Return (DataFrame with OHLCV, currency_str, current_market_price_or_None)."""
+    data = _yf_chart(ticker, range_="1y", interval="1d")
+    result = (data.get("chart") or {}).get("result")
+    if not result:
+        return pd.DataFrame(), "USD", None
+    result = result[0]
+    meta = result.get("meta", {})
+    currency = meta.get("currency", "USD")
+    current_price = meta.get("regularMarketPrice")
+    timestamps = result.get("timestamp") or []
+    quotes = (result.get("indicators") or {}).get("quote", [{}])[0]
+    if not timestamps:
+        return pd.DataFrame(), currency, current_price
+    df = pd.DataFrame(
+        {
+            "Open":   quotes.get("open",   [None] * len(timestamps)),
+            "High":   quotes.get("high",   [None] * len(timestamps)),
+            "Low":    quotes.get("low",    [None] * len(timestamps)),
+            "Close":  quotes.get("close",  [None] * len(timestamps)),
+            "Volume": quotes.get("volume", [None] * len(timestamps)),
+        },
+        index=pd.to_datetime(
+            [datetime.utcfromtimestamp(t) for t in timestamps]
+        ),
+    )
+    df.index.name = "Date"
+    return df, currency, current_price
+
+
+def _get_last_price(ticker):
+    """Return the last market price for a ticker (used for FX rates)."""
+    try:
+        data = _yf_chart(ticker, range_="1d", interval="1m")
+        result = (data.get("chart") or {}).get("result")
+        if result:
+            return result[0].get("meta", {}).get("regularMarketPrice")
+    except Exception:
+        pass
+    return None
+
+
+def get_cached_analysis(identifier):
+    cached = ANALYSIS_CACHE.get(identifier)
+    if not cached:
+        return None
+
+    if time.time() - cached["timestamp"] > ANALYSIS_CACHE_TTL_SECONDS:
+        ANALYSIS_CACHE.pop(identifier, None)
+        return None
+
+    return cached["data"]
+
+
+def set_cached_analysis(identifier, data):
+    ANALYSIS_CACHE[identifier] = {"timestamp": time.time(), "data": data}
 
 # --- Mapeo ISIN a Ticker ---
 ISIN_TO_TICKER = {
@@ -16,22 +169,57 @@ ISIN_TO_TICKER = {
     "US01609W1027": "BABA", "US04650F1012": "ATAI", "US67066G1040": "NVDA", "US8740391003": "TSM"
 }
 
-def analyze_stock(identifier):
-    ticker = ISIN_TO_TICKER.get(identifier.upper(), identifier.upper())
+_ISIN_PATTERN = re.compile(r'^[A-Z]{2}[A-Z0-9]{10}$')
+
+def _resolve_isin_to_ticker(isin: str) -> str:
+    """Query Yahoo Finance search to resolve an unmapped ISIN to a ticker symbol."""
+    session, _crumb = _get_yf_session()
     try:
-        # 1. Obtener Divisas (Optimizado para Nube)
-        # Solo descargamos el último valor, no el historial, para ahorrar memoria
+        resp = session.get(
+            "https://query1.finance.yahoo.com/v1/finance/search",
+            params={"q": isin, "quotesCount": 5, "newsCount": 0, "enableFuzzyQuery": False},
+            timeout=10,
+            verify=_YF_VERIFY_SSL,
+        )
+        if resp.status_code != 200:
+            app.logger.warning("ISIN search %s → HTTP %s", isin, resp.status_code)
+            return isin
+        data = resp.json()
+        # Response structure: {"quotes": [{"symbol": "VOW3.DE", ...}], ...}
+        quotes = data.get("quotes", [])
+        if quotes:
+            symbol = quotes[0].get("symbol", isin)
+            app.logger.info("ISIN %s resolved to %s", isin, symbol)
+            return symbol
+        app.logger.warning("ISIN search %s returned no quotes: %s", isin, data)
+    except Exception as exc:
+        app.logger.warning("ISIN resolve error for %s: %s", isin, exc)
+    return isin
+
+
+def analyze_stock(identifier):
+    normalized_identifier = identifier.upper()
+    cached_result = get_cached_analysis(normalized_identifier)
+    if cached_result:
+        return cached_result
+
+    ticker = ISIN_TO_TICKER.get(normalized_identifier, normalized_identifier)
+    # If still looks like an ISIN (not in static map), try dynamic resolution
+    if ticker == normalized_identifier and _ISIN_PATTERN.match(normalized_identifier):
+        ticker = _resolve_isin_to_ticker(normalized_identifier)
+    try:
+        # 1. Obtener Divisas
         u_e, c_e = 0.92, 0.68
         try:
-            fx_usd = yf.Ticker("EURUSD=X").fast_info['last_price']
+            fx_usd = _get_last_price("EURUSD=X")
             u_e = 1 / fx_usd if fx_usd else 0.92
-            fx_cad = yf.Ticker("EURCAD=X").fast_info['last_price']
+            fx_cad = _get_last_price("EURCAD=X")
             c_e = 1 / fx_cad if fx_cad else 0.68
-        except: pass
+        except Exception:
+            pass
 
         # 2. Descargar Datos
-        stock = yf.Ticker(ticker)
-        df = stock.history(period="1y")
+        df, currency, market_price = _download_history(ticker)
         if df.empty or len(df) < 50:
             return {"error": f"No hay datos suficientes para {identifier}."}
         
@@ -42,8 +230,8 @@ def analyze_stock(identifier):
         df.ta.ema(length=20, append=True)
         df.ta.ema(length=50, append=True)
         df.ta.bbands(length=20, append=True)
+        df.ta.atr(length=14, append=True)
         
-        currency = stock.info.get('currency', 'USD')
         rate = u_e if currency == 'USD' else c_e if currency == 'CAD' else 1.0
         
         def gs(df, k, m=1.0):
@@ -69,6 +257,9 @@ def analyze_stock(identifier):
         bbl = gs(df, 'BBL', rate)
         
         curr_p = prices[-1]
+        # Use real-time market price if available (regularMarketPrice from API meta)
+        if market_price:
+            curr_p = round(float(market_price) * rate, 2)
         rsi_val = rsi[-1]
         
         # --- GENERAR ARGUMENTOS ---
@@ -94,10 +285,18 @@ def analyze_stock(identifier):
         if trend_status == "BAJISTA" and rsi_val > 65: rec = "VENTA"
         if rsi_val < 30: rec = "COMPRA (Rebote)"
 
-        return {
-            'name': stock.info.get('longName', identifier),
+        entry_price = round(ema20[-1], 2)
+        # ATR-based stop: entry - 1.5 × ATR14 (adapted to actual volatility)
+        atr_col = next((c for c in df.columns if 'ATR' in c.upper()), None)
+        atr_val = float(df[atr_col].dropna().iloc[-1]) * rate if atr_col else abs(entry_price * 0.05)
+        stop_price = round(entry_price - 1.5 * atr_val, 2)
+        risk_pct = round((entry_price - stop_price) / entry_price * 100, 1) if entry_price else 0
+
+        result = {
+            'name': ticker,
             'price_eur': curr_p, 'trend': trend_status,
-            'buy_price': round(ema20[-1], 2), 'stop_loss': round(ema50[-1] * 0.97, 2),
+            'buy_price': entry_price, 'stop_loss': stop_price,
+            'risk_pct': risk_pct,
             'recommendation': rec, 'arguments': args,
             'chart': {
                 'dates': df.index.strftime('%Y-%m-%d').tolist()[-limit:],
@@ -106,7 +305,19 @@ def analyze_stock(identifier):
                 'bbu': bbu, 'bbl': bbl
             }
         }
-    except Exception as e: return {"error": str(e)}
+        set_cached_analysis(normalized_identifier, result)
+        return result
+    except RuntimeError as e:
+        if "rate_limit" in str(e):
+            stale_result = ANALYSIS_CACHE.get(normalized_identifier, {}).get("data")
+            if stale_result:
+                return stale_result
+            return {
+                "error": "Yahoo Finance está limitando temporalmente las peticiones. Espera unos minutos y vuelve a intentarlo."
+            }
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -151,7 +362,7 @@ HTML_TEMPLATE = """
                     <span class="badge bg-secondary">{{ result.trend }}</span>
                 </div>
                 <div class="col-md-4"><div class="buy-box"><small class="text-info">ENTRADA</small><div class="h3 text-white mb-0">{{ result.buy_price }} €</div></div></div>
-                <div class="col-md-4"><div class="stop-box"><small class="text-danger">STOP LOSS</small><div class="h4 text-white mb-0">{{ result.stop_loss }} €</div></div></div>
+                <div class="col-md-4"><div class="stop-box"><small class="text-danger">STOP LOSS</small><div class="h4 text-white mb-0">{{ result.stop_loss }} €</div><small class="text-muted">Riesgo: {{ result.risk_pct }}%</small></div></div>
             </div>
             <div class="arg-box mb-4">
                 <h5>🤖 Estrategia: <span class="rec-{{ result.recommendation.split(' ')[0] }}">{{ result.recommendation }}</span></h5>
